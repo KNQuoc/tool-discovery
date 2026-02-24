@@ -1,0 +1,13 @@
+{
+  "name": "tool-discovery",
+  "version": "0.1.0",
+  "description": "Extract API tools/endpoints from any docs URL",
+  "type": "module",
+  "main": "discover.mjs",
+  "scripts": {
+    "discover": "node discover.mjs"
+  },
+  "dependencies": {
+    "openai": "^4.80.0"
+  }
+}
