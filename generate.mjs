@@ -74,15 +74,13 @@ function toUniversalNode(tool, serviceName) {
     ...(p.default !== undefined ? { default: p.default } : {}),
   }));
   
-  // Build outputs — we don't always know the response schema,
-  // so provide sensible defaults
-  const outputs = tool.responseSchema
-    ? parseResponseSchema(tool.responseSchema)
-    : [
-        { name: 'status', type: 'number', description: 'HTTP status code' },
-        { name: 'body', type: 'object', description: 'Response body' },
-        { name: 'ok', type: 'boolean', description: 'Whether request succeeded (2xx)' },
-      ];
+  // Build outputs — use response schema if available, otherwise infer from method/name
+  let outputs;
+  if (tool.responseSchema) {
+    outputs = parseResponseSchema(tool.responseSchema);
+  } else {
+    outputs = inferOutputSchema(tool.name, method, path);
+  }
   
   const id = `${sanitizeId(serviceName)}__${sanitizeId(tool.name)}`;
   
@@ -121,42 +119,10 @@ function toUniversalNode(tool, serviceName) {
 function toJamNodes(universalNodes, serviceName, baseUrl) {
   const imports = `import { z } from 'zod';
 import { defineNode } from '@jam-nodes/core';
-import type { NodeExecutionContext } from '@jam-nodes/core';`;
+import { executeRequest, type HttpResponse } from './runtime';`;
 
-  const credentialType = `
-/**
- * Credential configuration for ${serviceName} API.
- * Injected at runtime via context.services.credentials
- */
-export interface ${pascalCase(serviceName)}Credentials {
-  baseUrl: string;
-  ${universalNodes[0]?.auth?.type === 'bearer' ? 'token: string;' : 'apiKey: string;'}
-}
-
-function getCredentials(context: NodeExecutionContext): ${pascalCase(serviceName)}Credentials {
-  const creds = context.services?.credentials?.['${serviceName}'] as ${pascalCase(serviceName)}Credentials | undefined;
-  if (!creds) throw new Error('Missing ${serviceName} credentials. Configure them in your workflow settings.');
-  return creds;
-}
-
-function buildUrl(creds: ${pascalCase(serviceName)}Credentials, pathTemplate: string, pathParams: Record<string, string> = {}): string {
-  let path = pathTemplate;
-  for (const [key, value] of Object.entries(pathParams)) {
-    path = path.replace(\`{\${key}}\`, encodeURIComponent(value));
-  }
-  return \`\${creds.baseUrl.replace(/\\/$/, '')}\${path}\`;
-}
-
-function buildHeaders(creds: ${pascalCase(serviceName)}Credentials): Record<string, string> {
-  return {
-    'Content-Type': 'application/json',
-    ${universalNodes[0]?.auth?.type === 'bearer'
-      ? "'Authorization': `Bearer ${creds.token}`,"
-      : universalNodes[0]?.auth?.header
-        ? `'${universalNodes[0].auth.header}': creds.apiKey,`
-        : "'Authorization': `Bearer ${creds.apiKey}`,"}
-  };
-}
+  const serviceConst = `
+const SERVICE = '${serviceName}';
 `;
 
   const nodeDefinitions = universalNodes.map(node => {
@@ -173,24 +139,24 @@ function buildHeaders(creds: ${pascalCase(serviceName)}Credentials): Record<stri
       return `  ${safeName(o.name)}: ${zodType}${desc},`;
     }).join('\n');
 
-    // Build path params extraction
-    const pathParamEntries = node.execution.pathParams.map(p =>
-      `    ${safeName(p)}: String(input.${safeName(p)}),`
-    ).join('\n');
+    // Build path params object
+    const pathParamObj = node.execution.pathParams.length > 0
+      ? `{ ${node.execution.pathParams.map(p => `${safeName(p)}: String(input.${safeName(p)})`).join(', ')} }`
+      : undefined;
 
-    // Build query string
-    const queryLines = node.execution.queryParams.map(p =>
-      `    if (input.${safeName(p)} !== undefined) params.append('${p}', String(input.${safeName(p)}));`
-    ).join('\n');
+    // Build query params object
+    const queryParamObj = node.execution.queryParams.length > 0
+      ? `{ ${node.execution.queryParams.map(p => `${safeName(p)}: input.${safeName(p)}`).join(', ')} }`
+      : undefined;
 
-    // Build body
-    const bodyFields = node.execution.bodyParams.map(p =>
-      `      ${safeName(p)}: input.${safeName(p)},`
-    ).join('\n');
+    // Build body object
+    const bodyObj = node.execution.bodyParams.length > 0
+      ? `{ ${node.execution.bodyParams.map(p => `${safeName(p)}: input.${safeName(p)}`).join(', ')} }`
+      : undefined;
 
-    const hasQuery = node.execution.queryParams.length > 0;
-    const hasBody = node.execution.bodyParams.length > 0;
-    const hasPathParams = node.execution.pathParams.length > 0;
+    // Determine if this is a list endpoint (GET with plural name, no path params beyond resource)
+    const isList = node.execution.method === 'GET' && 
+      (node.name.startsWith('List') || node.name.startsWith('Search') || node.name.startsWith('Get All'));
 
     return `
 // ── ${node.name} ──────────────────────────────────────
@@ -210,30 +176,25 @@ export const ${camelCase(node.id)}Node = defineNode({
   category: 'integration',
   inputSchema: ${camelCase(node.id)}InputSchema,
   outputSchema: ${camelCase(node.id)}OutputSchema,
-  estimatedDuration: 5,
+  estimatedDuration: ${isList ? 10 : 5},
   capabilities: { supportsRerun: true },
   executor: async (input, context) => {
-    const creds = getCredentials(context);
-    ${hasPathParams ? `const url = buildUrl(creds, '${node.execution.pathTemplate}', {\n${pathParamEntries}\n    });` : `const url = buildUrl(creds, '${node.execution.pathTemplate}');`}
-${hasQuery ? `    const params = new URLSearchParams();\n${queryLines}\n    const fullUrl = params.toString() ? \`\${url}?\${params}\` : url;` : '    const fullUrl = url;'}
-
     try {
-      const response = await fetch(fullUrl, {
+      const response = await executeRequest({
+        service: SERVICE,
         method: '${node.execution.method}',
-        headers: buildHeaders(creds),
-${hasBody ? `        body: JSON.stringify({\n${bodyFields}\n        }),` : ''}
-      });
-
-      const body = await response.json().catch(() => ({}));
+        pathTemplate: '${node.execution.pathTemplate}',
+        context,
+${pathParamObj ? `        pathParams: ${pathParamObj},\n` : ''}${queryParamObj ? `        queryParams: ${queryParamObj} as any,\n` : ''}${bodyObj ? `        body: ${bodyObj},\n` : ''}      });
 
       return {
         success: response.ok,
         output: {
           status: response.status,
-          body,
+          body: response.body as any,
           ok: response.ok,
         },
-        ...(!response.ok ? { error: \`HTTP \${response.status}: \${JSON.stringify(body)}\` } : {}),
+        ...(!response.ok ? { error: \`[\${response.status}] \${typeof response.body === 'object' ? (response.body as any)?.message || (response.body as any)?.error?.message || JSON.stringify(response.body) : response.body}\` } : {}),
       };
     } catch (error) {
       return {
@@ -251,7 +212,7 @@ ${hasBody ? `        body: JSON.stringify({\n${bodyFields}\n        }),` : ''}
   ).join('\n');
 
   return {
-    nodeFile: `${imports}\n${credentialType}\n${nodeDefinitions}\n`,
+    nodeFile: `${imports}\n${serviceConst}\n${nodeDefinitions}\n`,
     indexFile: exports,
     nodeCount: universalNodes.length,
   };
@@ -433,6 +394,67 @@ function humanize(s) {
   return s.replace(/[_-]/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 }
 
+/**
+ * Infer output schema from endpoint name/method/path when no explicit schema exists.
+ * Smarter than always returning generic {status, body, ok}.
+ */
+function inferOutputSchema(name, method, path) {
+  const nameLower = (name || '').toLowerCase();
+  const base = [
+    { name: 'status', type: 'number', description: 'HTTP status code' },
+    { name: 'ok', type: 'boolean', description: 'Whether request succeeded (2xx)' },
+  ];
+  
+  // DELETE typically returns minimal data
+  if (method === 'DELETE') {
+    return [
+      ...base,
+      { name: 'deleted', type: 'boolean', description: 'Whether the resource was deleted' },
+    ];
+  }
+  
+  // List/search endpoints return arrays
+  if (nameLower.startsWith('list') || nameLower.startsWith('search') || nameLower.startsWith('get_all')) {
+    return [
+      ...base,
+      { name: 'items', type: 'array', description: 'Array of returned items' },
+      { name: 'total', type: 'number', description: 'Total number of items (if provided)' },
+      { name: 'hasMore', type: 'boolean', description: 'Whether more items exist' },
+    ];
+  }
+  
+  // Create endpoints return the created resource
+  if (nameLower.startsWith('create') || method === 'POST') {
+    return [
+      ...base,
+      { name: 'id', type: 'string', description: 'ID of the created resource' },
+      { name: 'body', type: 'object', description: 'Created resource data' },
+    ];
+  }
+  
+  // Update endpoints
+  if (nameLower.startsWith('update') || method === 'PUT' || method === 'PATCH') {
+    return [
+      ...base,
+      { name: 'body', type: 'object', description: 'Updated resource data' },
+    ];
+  }
+  
+  // Get/retrieve single resource
+  if (nameLower.startsWith('get') || nameLower.startsWith('retrieve') || nameLower.startsWith('fetch')) {
+    return [
+      ...base,
+      { name: 'body', type: 'object', description: 'Resource data' },
+    ];
+  }
+  
+  // Default fallback
+  return [
+    ...base,
+    { name: 'body', type: 'object', description: 'Response body' },
+  ];
+}
+
 function parseResponseSchema(schema) {
   // Try to parse response schema into output fields
   if (typeof schema === 'object' && schema.properties) {
@@ -535,6 +557,13 @@ Examples:
       const indexFile = join(outputDir, 'index.ts');
       writeFileSync(nodeFile, result.nodeFile);
       writeFileSync(indexFile, result.indexFile);
+      // Copy shared runtime
+      const runtimeSrc = join(new URL('.', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'), 'runtime.ts');
+      const runtimeDst = join(outputDir, 'runtime.ts');
+      if (existsSync(runtimeSrc)) {
+        writeFileSync(runtimeDst, readFileSync(runtimeSrc));
+        log(`  Copied shared runtime to ${runtimeDst}`);
+      }
       log(`✅ Wrote ${result.nodeCount} jam-nodes definitions to ${nodeFile}`);
       break;
     }
