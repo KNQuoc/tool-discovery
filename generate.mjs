@@ -168,8 +168,9 @@ function buildHeaders(creds: ${pascalCase(serviceName)}Credentials): Record<stri
     }).join('\n');
 
     const outputSchemaFields = node.outputs.map(o => {
-      let zodType = typeToZod(o);
-      return `  ${safeName(o.name)}: ${zodType},`;
+      const zodType = typeToZod(o);
+      const desc = o.description ? `.describe(${JSON.stringify(o.description)})` : '';
+      return `  ${safeName(o.name)}: ${zodType}${desc},`;
     }).join('\n');
 
     // Build path params extraction
@@ -289,7 +290,9 @@ function toOpenAIFunctions(universalNodes) {
 function toLangChainTools(universalNodes, serviceName, baseUrl) {
   const toolDefs = universalNodes.map(node => {
     const zodFields = node.inputs.map(i => {
-      let field = `  ${safeName(i.name)}: z.${typeToZodBase(i.type)}()`;
+      const base = typeToZodBase(i.type);
+      const zodCall = base.includes('(') ? `z.${base}` : `z.${base}()`;
+      let field = `  ${safeName(i.name)}: ${zodCall}`;
       if (i.description) field += `.describe(${JSON.stringify(i.description)})`;
       if (!i.required) field += `.optional()`;
       return field + ',';
@@ -365,9 +368,15 @@ function normalizeType(t) {
 function typeToZod(field) {
   const t = field.type || 'string';
   if (field.enum && field.enum.length > 0) {
-    return `z.enum([${field.enum.map(e => JSON.stringify(e)).join(', ')}])`;
+    const vals = field.enum.filter(e => typeof e === 'string' && e.length > 0);
+    if (vals.length > 0) {
+      return `z.enum([${vals.map(e => JSON.stringify(e)).join(', ')}])`;
+    }
   }
-  return `z.${typeToZodBase(t)}()${field.default !== undefined ? `.default(${JSON.stringify(field.default)})` : ''}`;
+  const base = typeToZodBase(t);
+  // typeToZodBase may return compound like "array(z.unknown())" — don't append ()
+  const zodStr = base.includes('(') ? `z.${base}` : `z.${base}()`;
+  return field.default !== undefined ? `${zodStr}.default(${JSON.stringify(field.default)})` : zodStr;
 }
 
 function typeToZodBase(type) {
@@ -410,7 +419,10 @@ function safeName(s) {
 }
 
 function camelCase(s) {
-  return s.replace(/[_-](\w)/g, (_, c) => c.toUpperCase()).replace(/^[A-Z]/, c => c.toLowerCase());
+  let result = s.replace(/[_-](\w)/g, (_, c) => c.toUpperCase()).replace(/^[A-Z]/, c => c.toLowerCase());
+  // Ensure valid JS identifier — prefix with _ if starts with digit
+  if (/^\d/.test(result)) result = '_' + result;
+  return result;
 }
 
 function pascalCase(s) {

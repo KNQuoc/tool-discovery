@@ -14,10 +14,11 @@
  *   node registry.mjs export <service> [--adapter jam-nodes|openai|langchain|n8n] [--output <dir>]
  */
 
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, existsSync, statSync } from 'fs';
-import { join, basename } from 'path';
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, existsSync } from 'fs';
+import { join, basename, dirname } from 'path';
 import { homedir } from 'os';
 import { execSync } from 'child_process';
+import { fileURLToPath } from 'url';
 
 const REGISTRY_DIR = join(homedir(), '.tool-discovery', 'nodes');
 
@@ -39,10 +40,15 @@ function listServices() {
       const serviceDir = join(REGISTRY_DIR, d.name);
       const versions = readdirSync(serviceDir, { withFileTypes: true })
         .filter(v => v.isDirectory())
-        .map(v => v.name);
+        .map(v => v.name)
+        .sort((a, b) => {
+          const na = parseInt(a.replace(/\D/g, '')) || 0;
+          const nb = parseInt(b.replace(/\D/g, '')) || 0;
+          return na - nb;
+        });
       
       // Load metadata from latest version
-      const latest = versions.sort().pop();
+      const latest = versions[versions.length - 1];
       const metaPath = join(serviceDir, latest, 'metadata.json');
       let meta = {};
       if (existsSync(metaPath)) {
@@ -187,7 +193,11 @@ function loadNodes(service, version) {
     const versions = readdirSync(serviceDir, { withFileTypes: true })
       .filter(d => d.isDirectory())
       .map(d => d.name)
-      .sort();
+      .sort((a, b) => {
+        const na = parseInt(a.replace(/\D/g, '')) || 0;
+        const nb = parseInt(b.replace(/\D/g, '')) || 0;
+        return na - nb;
+      });
     version = versions[versions.length - 1]; // latest
   }
   
@@ -467,7 +477,7 @@ Registry location: ${REGISTRY_DIR}
       writeFileSync(tmpFile, JSON.stringify(discoveryFormat));
       
       try {
-        const scriptDir = new URL('.', import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1');
+        const scriptDir = dirname(fileURLToPath(import.meta.url));
         execSync(
           `node "${join(scriptDir, 'generate.mjs')}" "${tmpFile}" --adapter ${adapter} --service ${service} --base-url "${data.baseUrl || ''}" --output "${outputDir}"`,
           { stdio: 'inherit' }
